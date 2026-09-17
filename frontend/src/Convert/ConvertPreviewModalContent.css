@@ -1,0 +1,37 @@
+.previews {
+  margin-top: 20px;
+}
+
+.book {
+  margin-bottom: 20px;
+
+  &:last-of-type {
+    margin-bottom: 0;
+  }
+}
+
+.bookHeader {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.bookSelectedContainer {
+  margin-bottom: 0;
+  margin-right: 10px;
+}
+
+.bookTitle {
+  font-weight: bold;
+}
+
+.selectAllInputContainer {
+  margin-right: auto;
+  padding-top: 6px;
+  padding-left: 15px;
+  font-size: 20px;
+}
+
+.selectAllInput {
+  margin-bottom: 0;
+}
