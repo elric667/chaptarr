@@ -1623,7 +1623,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
 
                 try
                 {
-                    var finalDestinationPath = GetConvertedImportDestinationPath(first, book, author, outputName, convertedQuality);
+                    var finalDestinationPath = GetConvertedImportDestinationPath(first, book, author, outputName, convertedQuality, inputFiles);
                     var finalDestinationFolder = Path.GetDirectoryName(finalDestinationPath);
                     if (finalDestinationFolder.IsNullOrWhiteSpace())
                     {
@@ -2408,7 +2408,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                 };
             }
 
-            private string GetConvertedImportDestinationPath(LocalBook source, Book book, Author author, string outputName, QualityModel convertedQuality)
+            private string GetConvertedImportDestinationPath(LocalBook source, Book book, Author author, string outputName, QualityModel convertedQuality, IReadOnlyCollection<string> inputFiles)
             {
                 if (source?.Edition == null)
                 {
@@ -2430,7 +2430,13 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     Edition = source.Edition,
                     Quality = convertedQuality,
                     Part = source.Part > 0 ? source.Part : 1,
-                    PartCount = source.PartCount
+                    PartCount = source.PartCount,
+
+                    // Carry the library-conversion context so this preview resolves to the same
+                    // folder the mover will actually use, and the destination conflict check and
+                    // work folder are judged against the real destination.
+                    IsLibraryConversion = source.IsLibraryConversion,
+                    GeneratedConversionSourcePaths = inputFiles?.ToList()
                 };
 
                 var previewBookFile = new BookFile
