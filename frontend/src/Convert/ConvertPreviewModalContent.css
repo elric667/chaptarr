@@ -17,8 +17,8 @@
 }
 
 .bookSelectedContainer {
-  margin-bottom: 0;
   margin-right: 10px;
+  margin-bottom: 0;
 }
 
 .bookTitle {
@@ -27,11 +27,11 @@
 
 .selectAllInputContainer {
   margin-right: auto;
-  padding-top: 6px;
-  padding-left: 15px;
-  font-size: 20px;
+  line-height: 30px;
 }
 
 .selectAllInput {
-  margin-bottom: 0;
+  composes: input from '~Components/Form/CheckInput.css';
+
+  margin: 0;
 }
