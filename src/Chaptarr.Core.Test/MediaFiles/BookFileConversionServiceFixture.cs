@@ -216,6 +216,69 @@ namespace Chaptarr.Core.Test.MediaFiles
         }
 
         [Test]
+        public void should_hand_the_task_cancellation_token_to_the_import()
+        {
+            GivenFiles(Mp3File(1, @"C:\books\author\book\01.mp3"));
+            using var cts = new CancellationTokenSource();
+
+            _service.Execute(new ConvertBookFilesCommand(AuthorId, new List<int> { 1 }), cts.Token);
+
+            Assert.That(_importApprovedBooks.Calls.Single().CancellationToken, Is.EqualTo(cts.Token));
+        }
+
+        [Test]
+        public void should_not_start_converting_when_the_task_is_already_cancelled()
+        {
+            GivenFiles(Mp3File(1, @"C:\books\author\book\01.mp3"));
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            Assert.Throws<OperationCanceledException>(() =>
+                _service.Execute(new ConvertBookFilesCommand(AuthorId, new List<int> { 1 }), cts.Token));
+
+            Assert.That(_importApprovedBooks.Calls, Is.Empty);
+        }
+
+        [Test]
+        public void should_stop_the_run_when_cancelled_while_a_book_is_converting()
+        {
+            var first = Mp3File(1, @"C:\books\author\book\01.mp3");
+            var second = Mp3File(2, @"C:\books\author\other\01.mp3");
+            second.EditionId = OtherEditionId;
+            GivenFiles(first, second);
+
+            using var cts = new CancellationTokenSource();
+            _importApprovedBooks.OnImport = () => cts.Cancel();
+
+            Assert.Throws<OperationCanceledException>(() =>
+                _service.Execute(new ConvertBookFilesCommand(AuthorId, new List<int> { 1, 2 }), cts.Token));
+
+            Assert.That(_importApprovedBooks.Calls.Count, Is.EqualTo(1), "the second book must not start");
+        }
+
+        [Test]
+        public void should_clear_the_tracked_conversion_status_when_a_book_finishes()
+        {
+            var tracking = DispatchProxy.Create<IConversionTrackingService, ConversionTrackingProxy>();
+            var service = new BookFileConversionService(
+                _authorService,
+                DispatchProxy.Create<IBookService, BookServiceProxy>(),
+                DispatchProxy.Create<IEditionService, EditionServiceProxy>(),
+                _mediaFileService,
+                new StubImportDecisionMaker(),
+                _importApprovedBooks,
+                _diskProvider,
+                LogManager.GetCurrentClassLogger(),
+                tracking);
+            GivenFiles(Mp3File(1, @"C:\books\author\book\01.mp3"));
+
+            service.Execute(new ConvertBookFilesCommand(AuthorId, new List<int> { 1 }));
+
+            Assert.That(((ConversionTrackingProxy)(object)tracking).Cleared,
+                Is.EqualTo(new List<string> { LocalConversionId.For(BookId, EditionId) }));
+        }
+
+        [Test]
         public void should_not_import_anything_when_no_file_is_eligible()
         {
             GivenFiles(File(2, @"C:\books\author\book\book.m4b", Quality.M4B));
@@ -382,9 +445,11 @@ namespace Chaptarr.Core.Test.MediaFiles
             public sealed record Call(
                 List<ImportDecision<LocalBook>> Decisions,
                 bool ReplaceExisting,
-                NzbDrone.Core.Download.DownloadClientItem DownloadClientItem);
+                NzbDrone.Core.Download.DownloadClientItem DownloadClientItem,
+                CancellationToken CancellationToken);
 
             public List<Call> Calls { get; } = new();
+            public Action OnImport { get; set; }
 
             public List<ImportResult> Import(
                 List<ImportDecision<LocalBook>> decisions,
@@ -393,7 +458,8 @@ namespace Chaptarr.Core.Test.MediaFiles
                 ImportMode importMode = ImportMode.Auto,
                 CancellationToken cancellationToken = default)
             {
-                Calls.Add(new Call(decisions, replaceExisting, downloadClientItem));
+                Calls.Add(new Call(decisions, replaceExisting, downloadClientItem, cancellationToken));
+                OnImport?.Invoke();
 
                 // Stand in for the conversion the real pipeline performs: one generated file that
                 // supersedes everything that went into it.
@@ -414,6 +480,25 @@ namespace Chaptarr.Core.Test.MediaFiles
                 {
                     new ImportResult(new ImportDecision<LocalBook>(converted), ImportResultType.Imported)
                 };
+            }
+        }
+
+        private class ConversionTrackingProxy : DispatchProxy
+        {
+            public List<string> Cleared { get; } = new();
+
+            protected override object Invoke(MethodInfo targetMethod, object[] args)
+            {
+                switch (targetMethod?.Name)
+                {
+                    case nameof(IConversionTrackingService.Clear):
+                        Cleared.Add((string)args[0]);
+                        return null;
+                    case nameof(IConversionTrackingService.Get):
+                        return null;
+                }
+
+                throw new NotImplementedException($"Test proxy does not implement IConversionTrackingService.{targetMethod?.Name}");
             }
         }
 

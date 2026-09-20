@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using NLog;
 using NzbDrone.Common.Disk;
 using NzbDrone.Common.Extensions;
@@ -13,6 +15,7 @@ using NzbDrone.Core.MediaFiles.BookImport.Identification;
 using NzbDrone.Core.MediaFiles.Commands;
 using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Parser.Model;
+using NzbDrone.Core.ProgressMessaging;
 using NzbDrone.Core.Qualities;
 
 namespace NzbDrone.Core.MediaFiles
@@ -70,7 +73,10 @@ namespace NzbDrone.Core.MediaFiles
         private readonly IMakeImportDecision _importDecisionMaker;
         private readonly IImportApprovedBooks _importApprovedBooks;
         private readonly IDiskProvider _diskProvider;
+        private readonly IConversionTrackingService _conversionTrackingService;
         private readonly Logger _logger;
+
+        private static readonly TimeSpan ProgressPollInterval = TimeSpan.FromSeconds(2);
 
         public BookFileConversionService(IAuthorService authorService,
                                          IBookService bookService,
@@ -79,7 +85,8 @@ namespace NzbDrone.Core.MediaFiles
                                          IMakeImportDecision importDecisionMaker,
                                          IImportApprovedBooks importApprovedBooks,
                                          IDiskProvider diskProvider,
-                                         Logger logger)
+                                         Logger logger,
+                                         IConversionTrackingService conversionTrackingService = null)
         {
             _authorService = authorService;
             _bookService = bookService;
@@ -88,6 +95,7 @@ namespace NzbDrone.Core.MediaFiles
             _importDecisionMaker = importDecisionMaker;
             _importApprovedBooks = importApprovedBooks;
             _diskProvider = diskProvider;
+            _conversionTrackingService = conversionTrackingService;
             _logger = logger;
         }
 
@@ -107,6 +115,13 @@ namespace NzbDrone.Core.MediaFiles
         }
 
         public void Execute(ConvertBookFilesCommand message)
+        {
+            Execute(message, CancellationToken.None);
+        }
+
+        // The command executor prefers this overload when a handler has one, and cancels the token
+        // when the task is cancelled from System > Tasks.
+        public void Execute(ConvertBookFilesCommand message, CancellationToken cancellationToken)
         {
             var author = _authorService.GetAuthor(message.AuthorId);
             if (author == null)
@@ -133,16 +148,22 @@ namespace NzbDrone.Core.MediaFiles
                 files = _mediaFileService.GetFilesByAuthor(author.Id);
             }
 
-            ConvertFiles(author, files);
+            ConvertFiles(author, files, cancellationToken);
         }
 
         public void Execute(ConvertAuthorCommand message)
+        {
+            Execute(message, CancellationToken.None);
+        }
+
+        public void Execute(ConvertAuthorCommand message, CancellationToken cancellationToken)
         {
             var authors = _authorService.GetAuthors(message.AuthorIds ?? new List<int>());
 
             foreach (var author in authors)
             {
-                ConvertFiles(author, _mediaFileService.GetFilesByAuthor(author.Id));
+                cancellationToken.ThrowIfCancellationRequested();
+                ConvertFiles(author, _mediaFileService.GetFilesByAuthor(author.Id), cancellationToken);
             }
         }
 
@@ -186,7 +207,7 @@ namespace NzbDrone.Core.MediaFiles
             return expanded.Values.ToList();
         }
 
-        private void ConvertFiles(Author author, List<BookFile> files)
+        private void ConvertFiles(Author author, List<BookFile> files, CancellationToken cancellationToken)
         {
             var groups = BuildConversionGroups(author, files);
 
@@ -205,15 +226,31 @@ namespace NzbDrone.Core.MediaFiles
 
             for (var i = 0; i < groups.Count; i++)
             {
-                var group = groups[i];
+                cancellationToken.ThrowIfCancellationRequested();
 
-                _logger.ProgressInfo("Converting '{0}' to {1} ({2}/{3})",
+                var group = groups[i];
+                var position = $"({i + 1}/{groups.Count})";
+
+                _logger.ProgressInfo("Converting '{0}' to {1} {2}",
                     group.Book.Title,
                     group.TargetQuality.Name,
-                    i + 1,
-                    groups.Count);
+                    position);
 
-                if (ConvertGroup(group))
+                var succeeded = ConvertGroup(group, position, cancellationToken);
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    // The converter was stopped part-way. Nothing is replaced until a conversion
+                    // finishes, so this book's original files are untouched.
+                    _logger.Info("[CONVERSION] Cancelled while converting '{0}'; its original files were left as they were. {1} of {2} book(s) had been converted.",
+                        group.Book.Title,
+                        converted,
+                        groups.Count);
+
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
+                if (succeeded)
                 {
                     converted++;
                 }
@@ -230,8 +267,11 @@ namespace NzbDrone.Core.MediaFiles
                 failed > 0 ? $"; {failed} failed (see log)" : string.Empty);
         }
 
-        private bool ConvertGroup(ConversionGroup group)
+        private bool ConvertGroup(ConversionGroup group, string position, CancellationToken cancellationToken)
         {
+            var conversionId = LocalConversionId.For(group.Book.Id, group.Edition.Id);
+            using var progressReporter = StartProgressReporter(group, position, conversionId);
+
             try
             {
                 var fileInfos = group.Files
@@ -277,7 +317,7 @@ namespace NzbDrone.Core.MediaFiles
                     decision.Item.Edition = group.Edition;
                 }
 
-                var results = _importApprovedBooks.Import(approved, replaceExisting: true);
+                var results = _importApprovedBooks.Import(approved, replaceExisting: true, cancellationToken: cancellationToken);
 
                 var importedConversion = results.Any(r => r.Result == ImportResultType.Imported &&
                                                           r.ImportDecision?.Item?.IsGeneratedConversion == true);
@@ -286,6 +326,12 @@ namespace NzbDrone.Core.MediaFiles
                 {
                     _logger.Info("[CONVERSION] Converted '{0}' to {1}", group.Book.Title, group.TargetQuality.Name);
                     return true;
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    // Not a failure: the caller reports the cancellation and stops the run.
+                    return false;
                 }
 
                 var errors = results
@@ -300,10 +346,123 @@ namespace NzbDrone.Core.MediaFiles
 
                 return false;
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Reported by the caller, which stops the run.
+                return false;
+            }
             catch (Exception ex)
             {
                 _logger.Error(ex, "[CONVERSION] Failed converting '{0}'", group.Book?.Title);
                 return false;
+            }
+            finally
+            {
+                // Library conversions have no queue item to retire their status, so drop it here.
+                _conversionTrackingService?.Clear(conversionId);
+            }
+        }
+
+        /// <summary>
+        /// The converter reports its progress to the conversion tracker from its own threads, which
+        /// the task's status message cannot see. Poll the tracker while a book converts and mirror
+        /// the percentage into this task's message, so it shows in the sidebar and in
+        /// System > Tasks.
+        /// </summary>
+        private IDisposable StartProgressReporter(ConversionGroup group, string position, string conversionId)
+        {
+            if (_conversionTrackingService == null)
+            {
+                return null;
+            }
+
+            var command = ProgressMessageContext.CommandModel;
+            var lastReported = -1;
+
+            return new PollingReporter(ProgressPollInterval, () =>
+            {
+                var progress = _conversionTrackingService.Get(conversionId)?.Progress;
+                if (!progress.HasValue)
+                {
+                    return;
+                }
+
+                var percent = (int)Math.Floor(progress.Value);
+                if (percent == lastReported)
+                {
+                    return;
+                }
+
+                lastReported = percent;
+
+                // This runs on a pool thread. Attribute the message to the conversion's task for the
+                // duration of this call only, so nothing else that later runs on the thread writes
+                // into that task's status.
+                var previous = ProgressMessageContext.CommandModel;
+                ProgressMessageContext.CommandModel = command;
+
+                try
+                {
+                    _logger.ProgressInfo("Converting '{0}' to {1} {2} - {3}%",
+                        group.Book.Title,
+                        group.TargetQuality.Name,
+                        position,
+                        percent);
+                }
+                finally
+                {
+                    ProgressMessageContext.CommandModel = previous;
+                }
+            });
+        }
+
+        private sealed class PollingReporter : IDisposable
+        {
+            private readonly CancellationTokenSource _stop = new();
+            private readonly Task _loop;
+
+            public PollingReporter(TimeSpan interval, Action report)
+            {
+                _loop = Task.Run(async () =>
+                {
+                    while (!_stop.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            await Task.Delay(interval, _stop.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+
+                        try
+                        {
+                            report();
+                        }
+                        catch
+                        {
+                            // Progress is best-effort; it must never disturb the conversion.
+                        }
+                    }
+                });
+            }
+
+            public void Dispose()
+            {
+                _stop.Cancel();
+
+                try
+                {
+                    // Let an in-flight report finish, so it cannot overwrite the next status message.
+                    _loop.Wait(TimeSpan.FromSeconds(5));
+                }
+                catch
+                {
+                    // Nothing to do: the loop only ever ends by cancellation.
+                }
+
+                _stop.Dispose();
             }
         }
 
