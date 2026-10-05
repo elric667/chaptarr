@@ -2432,8 +2432,13 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     Book = book,
                     Edition = source.Edition,
                     Quality = convertedQuality,
-                    Part = source.Part > 0 ? source.Part : 1,
-                    PartCount = source.PartCount,
+
+                    // No Part or PartCount. The converted file is a single M4B, and
+                    // CreateGeneratedConversionLocalBook gives it neither, so it is named without a
+                    // part suffix. Copying the first source file's "1 of N" here named the preview
+                    // "Title - 01.m4b" while the import wrote "Title.m4b": the conflict check looked
+                    // at the wrong path, and a taken destination was only found after a full
+                    // conversion (#284).
 
                     // Carry the library-conversion context so this preview resolves to the same
                     // folder the mover will actually use, and the destination conflict check and
@@ -2449,7 +2454,9 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     EditionId = source.Edition.Id,
                     Edition = source.Edition,
                     Author = author,
-                    Part = previewLocalBook.Part,
+
+                    // The same part values the import gives the converted file's BookFile.
+                    Part = previewLocalBook.Part > 0 ? previewLocalBook.Part : 1,
                     PartCount = previewLocalBook.PartCount,
                     MediaType = BookFile.DetermineMediaType(convertedQuality)
                 };
